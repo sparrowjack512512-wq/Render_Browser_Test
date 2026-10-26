@@ -53,9 +53,9 @@ def main():
         log.info("STEP 5: Starting browser health-check loop")
 
         while not stop_event.is_set():
-            log.info("WAITING: Next health check in 60 seconds")
+            log.info("WAITING: Next health check in 10 seconds")
 
-            if stop_event.wait(60):
+            if stop_event.wait(10):
                 break
 
             try:
