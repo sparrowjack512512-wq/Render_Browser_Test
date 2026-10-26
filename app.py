@@ -1,102 +1,235 @@
 
 import logging
+import os
 import signal
 import sys
 import threading
+import time
 import traceback
 
+from flask import Flask, jsonify
 from seleniumbase import Driver
+
+# ---------------- CONFIGURATION ----------------
+
+TEST_URL = "https://example.com/"
+RESTART_AFTER_CYCLES = 30
+CYCLE_INTERVAL_SECONDS = 10
+PAGE_LOAD_TIMEOUT_SECONDS = 30
+FLASK_PORT = int(os.environ.get("PORT", "10000"))
+
+# ---------------- LOGGING ----------------
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(sys.stdout)],
     force=True,
 )
 
 log = logging.getLogger("render-browser-worker")
+
+# ---------------- STATE ----------------
+
+app = Flask(__name__)
 stop_event = threading.Event()
+state_lock = threading.Lock()
+
+state = {
+    "running": False,
+    "browser_ready": False,
+    "cycle": 0,
+    "browser_restarts": 0,
+    "last_error": None,
+    "last_success": None,
+}
+
+
+def update_state(**kwargs):
+    with state_lock:
+        state.update(kwargs)
+
+
+def get_state():
+    with state_lock:
+        return dict(state)
 
 
 def handle_shutdown(signum, frame):
-    log.info("Shutdown signal received.")
+    log.info("Shutdown signal received: %s", signum)
     stop_event.set()
 
 
-def main():
-    driver = None
+def create_browser():
+    log.info("Starting Chrome browser")
 
-    signal.signal(signal.SIGTERM, handle_shutdown)
-    signal.signal(signal.SIGINT, handle_shutdown)
+    browser = Driver(
+        browser="chrome",
+        headless=True,
+        binary_location="/usr/bin/google-chrome",
+    )
+
+    browser.set_page_load_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
+    browser.set_script_timeout(PAGE_LOAD_TIMEOUT_SECONDS)
+
+    log.info("Chrome started successfully")
+    return browser
+
+
+def run_test_cycle(browser, cycle_number):
+    log.info("Cycle %s: opening test website", cycle_number)
+
+    browser.get(TEST_URL)
+
+    title = browser.title
+    url = browser.current_url
+
+    if not title:
+        raise RuntimeError("Test page returned an empty title")
+
+    log.info(
+        "Cycle %s passed | title=%r | url=%s",
+        cycle_number,
+        title,
+        url,
+    )
+
+    update_state(
+        cycle=cycle_number,
+        last_success=time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+        last_error=None,
+    )
+
+
+def worker():
+    browser = None
+    cycles_since_restart = 0
+
+    update_state(running=True, browser_ready=False)
+    log.info("Worker started")
 
     try:
-        log.info("STEP 1: Starting Chrome")
-
-        driver = Driver(
-            browser="chrome",
-            headless=False,
-            binary_location="/usr/bin/google-chrome",
-        )
-
-        driver.set_page_load_timeout(30)
-        driver.set_script_timeout(30)
-
-        log.info("STEP 2: Chrome launched successfully")
-
-        log.info("STEP 3: Opening initial test website")
-        driver.get("https://example.com/")
-
-        log.info("STEP 4: Initial navigation completed")
-        log.info("Initial page title: %s", driver.title)
-        log.info("Initial page URL: %s", driver.current_url)
-
-        log.info("STEP 5: Starting browser health-check loop")
-
         while not stop_event.is_set():
-            log.info("WAITING: Next health check in 10 seconds")
-
-            if stop_event.wait(10):
-                break
-
             try:
-                log.info("HEARTBEAT: Checking browser URL")
+                if browser is None:
+                    browser = create_browser()
+                    update_state(browser_ready=True)
 
-                current_url = driver.current_url
-                log.info("HEARTBEAT: URL check passed: %s", current_url)
+                cycle_number = cycles_since_restart + 1
+                run_test_cycle(browser, cycle_number)
+                cycles_since_restart += 1
 
-                log.info("HEARTBEAT: Checking browser page title")
+                if cycles_since_restart >= RESTART_AFTER_CYCLES:
+                    log.info(
+                        "Completed %s cycles; restarting browser",
+                        cycles_since_restart,
+                    )
 
-                page_title = driver.title
-                log.info("HEARTBEAT: Title check passed: %s", page_title)
+                    update_state(browser_ready=False)
 
-                log.info("HEARTBEAT: Browser session is responding")
+                    try:
+                        browser.quit()
+                        log.info("Old browser closed")
+                    except Exception:
+                        log.exception("Error closing old browser")
 
-            except Exception:
-                log.error(
-                    "HEARTBEAT FAILED:\n%s",
-                    traceback.format_exc(),
+                    browser = None
+                    cycles_since_restart = 0
+
+                    if stop_event.is_set():
+                        break
+
+                    browser = create_browser()
+                    update_state(
+                        browser_ready=True,
+                        browser_restarts=get_state()["browser_restarts"] + 1,
+                    )
+                    log.info("Browser restart completed")
+
+            except Exception as exc:
+                error_text = f"{type(exc).__name__}: {exc}"
+                log.error("Cycle failed: %s", error_text)
+                log.debug("%s", traceback.format_exc())
+
+                update_state(
+                    browser_ready=False,
+                    last_error=error_text,
                 )
 
-        log.info("Worker shutdown requested")
+                if browser is not None:
+                    try:
+                        browser.quit()
+                    except Exception:
+                        log.exception("Error closing failed browser")
 
-    except Exception:
-        log.critical(
-            "WORKER STARTUP FAILED:\n%s",
-            traceback.format_exc(),
-        )
-        sys.exit(1)
+                    browser = None
+
+                if stop_event.wait(5):
+                    break
+
+            if stop_event.wait(CYCLE_INTERVAL_SECONDS):
+                break
 
     finally:
-        if driver is not None:
+        update_state(browser_ready=False)
+
+        if browser is not None:
             try:
-                log.info("Closing Chrome")
-                driver.quit()
+                browser.quit()
                 log.info("Chrome closed successfully")
             except Exception:
-                log.exception("Error while closing Chrome")
+                log.exception("Error during browser shutdown")
 
+        update_state(running=False)
         log.info("Worker stopped")
 
 
+@app.route("/")
+def health():
+    current = get_state()
+    status_code = 200 if current["running"] else 503
+
+    return jsonify({
+        "service": "Render Browser Test",
+        **current,
+    }), status_code
+
+
+@app.route("/health")
+def health_check():
+    current = get_state()
+
+    healthy = (
+        current["running"]
+        and current["browser_ready"]
+        and current["last_error"] is None
+    )
+
+    return jsonify({
+        "healthy": healthy,
+        **current,
+    }), 200 if healthy else 503
+
+
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
+    worker_thread = threading.Thread(
+        target=worker,
+        name="browser-worker",
+        daemon=True,
+    )
+    worker_thread.start()
+
+    log.info("Starting Flask health server on port %s", FLASK_PORT)
+
+    try:
+        app.run(
+            host="0.0.0.0",
+            port=FLASK_PORT,
+            use_reloader=False,
+        )
+    finally:
+        stop_event.set()
+        worker_thread.join(timeout=10)
