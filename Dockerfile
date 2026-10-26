@@ -39,4 +39,4 @@ COPY app.py .
 
 RUN google-chrome --version
 
-CMD ["xvfb-run", "-a", "-s", "-screen 0 1920x1080x24", "python", "-u", "app.py"]
+CMD ["sh", "-c", "echo 'CONTAINER STARTED'; xvfb-run -a -s '-screen 0 1920x1080x24' python -u app.py"]
