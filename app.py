@@ -1,7 +1,11 @@
 
 import logging
+import signal
 import sys
+import threading
+import time
 import traceback
+
 from seleniumbase import Driver
 
 logging.basicConfig(
@@ -11,14 +15,23 @@ logging.basicConfig(
     force=True,
 )
 
-log = logging.getLogger("render-browser-test")
+log = logging.getLogger("render-browser-worker")
+stop_event = threading.Event()
+
+
+def handle_shutdown(signum, frame):
+    log.info("Shutdown signal received. Stopping worker...")
+    stop_event.set()
 
 
 def main():
     driver = None
 
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+
     try:
-        log.info("STEP 1: Starting SeleniumBase")
+        log.info("STEP 1: Starting persistent Chrome worker")
 
         driver = Driver(
             browser="chrome",
@@ -28,28 +41,46 @@ def main():
 
         log.info("STEP 2: Chrome launched successfully")
 
-        driver.get("https://example.com")
+        driver.get("https://example.com/")
 
-        log.info("STEP 3: Website opened")
+        log.info("STEP 3: Initial page loaded")
         log.info("Page title: %s", driver.title)
         log.info("Current URL: %s", driver.current_url)
 
-        driver.save_screenshot("/tmp/browser-test.png")
-        log.info("STEP 4: Screenshot saved")
+        log.info("Worker is now running. Heartbeat interval: 60 seconds")
 
-        log.info("SUCCESS: Render Chrome test passed")
+        while not stop_event.wait(60):
+            try:
+                driver.get("https://example.com/")
 
-    except BaseException as e:
-        log.critical("FAILED: %s: %s", type(e).__name__, e)
-        log.critical(traceback.format_exc())
+                log.info(
+                    "HEARTBEAT: Browser is responding | title=%s | url=%s",
+                    driver.title,
+                    driver.current_url,
+                )
+
+            except Exception:
+                log.error(
+                    "Browser health check failed:\n%s",
+                    traceback.format_exc(),
+                )
+
+    except Exception:
+        log.critical(
+            "Worker startup failed:\n%s",
+            traceback.format_exc(),
+        )
         sys.exit(1)
 
     finally:
         if driver is not None:
             try:
                 driver.quit()
+                log.info("Chrome closed successfully")
             except Exception:
-                pass
+                log.exception("Error while closing Chrome")
+
+        log.info("Worker stopped")
 
 
 if __name__ == "__main__":
