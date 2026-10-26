@@ -167,8 +167,13 @@ def worker():
                 if stop_event.wait(5):
                     break
 
+            log.info("WAIT: Beginning %s-second cycle delay", CYCLE_INTERVAL_SECONDS)
+
             if stop_event.wait(CYCLE_INTERVAL_SECONDS):
+                log.info("Shutdown requested during cycle delay")
                 break
+            
+            log.info("WAIT: Delay finished; starting next cycle")
 
     finally:
         update_state(browser_ready=False)
